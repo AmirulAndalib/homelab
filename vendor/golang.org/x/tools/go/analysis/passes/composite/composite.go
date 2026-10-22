@@ -7,13 +7,16 @@
 package composite
 
 import (
+	"fmt"
 	"go/ast"
 	"go/types"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/internal/typeparams"
 )
 
 const Doc = `check for unkeyed composite literals
@@ -35,6 +38,7 @@ should be replaced by:
 var Analyzer = &analysis.Analyzer{
 	Name:             "composites",
 	Doc:              Doc,
+	URL:              "https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/composite",
 	Requires:         []*analysis.Analyzer{inspect.Analyzer},
 	RunDespiteErrors: true,
 	Run:              run,
@@ -46,72 +50,97 @@ func init() {
 	Analyzer.Flags.BoolVar(&whitelist, "whitelist", whitelist, "use composite white list; for testing only")
 }
 
-// runUnkeyedLiteral checks if a composite literal is a struct literal with
-// unkeyed fields.
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
-	nodeFilter := []ast.Node{
-		(*ast.CompositeLit)(nil),
-	}
-	inspect.Preorder(nodeFilter, func(n ast.Node) {
-		cl := n.(*ast.CompositeLit)
+	for curLit := range inspect.Root().Preorder((*ast.CompositeLit)(nil)) {
+		complit := curLit.Node().(*ast.CompositeLit)
 
-		typ := pass.TypesInfo.Types[cl].Type
-		if typ == nil {
-			// cannot determine composite literals' type, skip it
-			return
+		// Skip empty or partly/fully keyed literals.
+		if len(complit.Elts) == 0 ||
+			slices.ContainsFunc(complit.Elts, func(e ast.Expr) bool { return is[*ast.KeyValueExpr](e) }) {
+			continue
 		}
+
+		// Find struct type.
+		// (For a type parameter, choose an arbitrary term.)
+		typ := pass.TypesInfo.Types[complit].Type
+		if typ == nil {
+			continue // no type info
+		}
+		terms, err := typeparams.NormalTerms(typ)
+		if err != nil || len(terms) == 0 {
+			continue // invalid or empty type
+		}
+		t := terms[0].Type()
+		strct, ok := typeparams.Deref(t).Underlying().(*types.Struct)
+		if !ok {
+			continue // not a struct literal
+		}
+		if isSamePackageType(pass, t) {
+			continue // allow unkeyed literals for structs in same package
+		}
+
+		// Allow whitelisted types.
 		typeName := typ.String()
 		if whitelist && unkeyedLiteral[typeName] {
-			// skip whitelisted types
-			return
-		}
-		under := typ.Underlying()
-		for {
-			ptr, ok := under.(*types.Pointer)
-			if !ok {
-				break
-			}
-			under = ptr.Elem().Underlying()
-		}
-		if _, ok := under.(*types.Struct); !ok {
-			// skip non-struct composite literals
-			return
-		}
-		if isLocalType(pass, typ) {
-			// allow unkeyed locally defined composite literal
-			return
+			continue
 		}
 
-		// check if the CompositeLit contains an unkeyed field
-		allKeyValue := true
-		for _, e := range cl.Elts {
-			if _, ok := e.(*ast.KeyValueExpr); !ok {
-				allKeyValue = false
-				break
+		// If there is one value per field,
+		// offer to fill in the field names.
+		var fixes []analysis.SuggestedFix
+		if len(complit.Elts) == strct.NumFields() {
+			var edits []analysis.TextEdit
+			for i, elt := range complit.Elts {
+				field := strct.Field(i)
+				// We cannot fill in the name of an
+				// exported field from another package.
+				if !field.Exported() {
+					edits = nil
+					break
+				}
+				edits = append(edits, analysis.TextEdit{
+					Pos:     elt.Pos(),
+					End:     elt.Pos(),
+					NewText: fmt.Appendf(nil, "%s: ", field.Name()),
+				})
+			}
+			if edits != nil {
+				fixes = []analysis.SuggestedFix{{
+					Message:   "Add field names to struct literal",
+					TextEdits: edits,
+				}}
 			}
 		}
-		if allKeyValue {
-			// all the composite literal fields are keyed
-			return
-		}
 
-		pass.ReportRangef(cl, "%s composite literal uses unkeyed fields", typeName)
-	})
+		pass.Report(analysis.Diagnostic{
+			Pos:            complit.Pos(),
+			End:            complit.End(),
+			Message:        fmt.Sprintf("%s struct literal uses unkeyed fields", typeName),
+			SuggestedFixes: fixes,
+		})
+	}
 	return nil, nil
 }
 
-func isLocalType(pass *analysis.Pass, typ types.Type) bool {
-	switch x := typ.(type) {
+// isSamePackageType reports whether typ belongs to the same package as pass.
+func isSamePackageType(pass *analysis.Pass, typ types.Type) bool {
+	switch x := types.Unalias(typ).(type) {
 	case *types.Struct:
 		// struct literals are local types
 		return true
 	case *types.Pointer:
-		return isLocalType(pass, x.Elem())
-	case *types.Named:
+		return isSamePackageType(pass, x.Elem())
+	case interface{ Obj() *types.TypeName }: // *Named or *TypeParam (aliases were removed already)
 		// names in package foo are local to foo_test too
-		return strings.TrimSuffix(x.Obj().Pkg().Path(), "_test") == strings.TrimSuffix(pass.Pkg.Path(), "_test")
+		return x.Obj().Pkg() != nil &&
+			strings.TrimSuffix(x.Obj().Pkg().Path(), "_test") == strings.TrimSuffix(pass.Pkg.Path(), "_test")
 	}
 	return false
+}
+
+func is[T any](x any) bool {
+	_, ok := x.(T)
+	return ok
 }
